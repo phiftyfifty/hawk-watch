@@ -1,0 +1,6 @@
+{
+  "lag_bytes_warn": 10485760,
+  "tables_allowed_to_shrink": [],
+  "max_stale_days_by_table": {},
+  "required_endpoints": []
+}

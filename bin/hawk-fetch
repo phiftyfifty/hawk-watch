@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# hawk-fetch — run the probe on the watched host and print its JSON snapshot.
+#
+# Nothing is copied to the host. The probe is piped over SSH into `bash -s`,
+# so it exists only in that shell's memory for the life of the run.
+#
+# The host is whatever HAWK_TARGET names in your SSH config, which is where a
+# tailnet hostname, a jump host (ProxyJump), or a dedicated key belongs. hawk
+# runs ssh in batch mode, so it never prompts and never handles a password.
+#
+# The probe's HAWK_* settings are read from the environment here and passed
+# along to the remote shell.
+#
+# Usage: hawk-fetch [--probe <path>] [--timeout <seconds>]
+# Output: snapshot JSON on stdout, diagnostics on stderr. Exit 0 on success.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "${HERE}/.." && pwd)"
+PROBE="${REPO}/probe/hawk-probe.sh"
+TIMEOUT="${HAWK_TIMEOUT:-180}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --probe)   PROBE="$2"; shift 2;;
+        --timeout) TIMEOUT="$2"; shift 2;;
+        -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
+        *) echo "hawk-fetch: unknown argument $1" >&2; exit 2;;
+    esac
+done
+
+[ -r "$PROBE" ] || { echo "hawk-fetch: cannot read probe at $PROBE" >&2; exit 2; }
+
+# With no target the probe runs right here, which is handy on the host itself.
+REMOTE_ENV=""
+for name in HAWK_PG_CONTAINER HAWK_PG_DB HAWK_PG_USER HAWK_PG_SCHEMA HAWK_SLOT \
+            HAWK_ENDPOINTS HAWK_COUNT_FIELD HAWK_SEED_DIR; do
+    if [ -n "${!name+set}" ]; then
+        REMOTE_ENV="${REMOTE_ENV} ${name}=$(printf '%q' "${!name}")"
+    fi
+done
+
+if [ -z "${HAWK_TARGET:-}" ]; then
+    exec bash "$PROBE"
+fi
+
+OUT="$(ssh -o BatchMode=yes -o ConnectTimeout=25 -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=$(( TIMEOUT / 15 + 1 )) \
+        "$HAWK_TARGET" "env${REMOTE_ENV} bash -s" < "$PROBE")" || {
+    echo "hawk-fetch: could not run the probe on ${HAWK_TARGET}" >&2
+    exit 1
+}
+
+if ! printf '%s' "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    echo "hawk-fetch: the snapshot from ${HAWK_TARGET} was not valid JSON" >&2
+    exit 1
+fi
+printf '%s\n' "$OUT"

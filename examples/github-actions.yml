@@ -1,0 +1,54 @@
+# Copy to .github/workflows/hawk.yml in a private repo of your own.
+# Repository secrets it expects:
+#   TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET  a Tailscale OAuth client tagged tag:ci
+#   HAWK_SSH_KEY                         a private key the server pins to a forced command
+#   HAWK_TARGET                          the server's tailnet hostname, e.g. user@db-prod
+name: hawk
+on:
+  schedule:
+    - cron: "15 16 * * *"
+  workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: phiftyfifty/hawk-watch
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+      - name: Fetch today's snapshot
+        env:
+          SSH_KEY: ${{ secrets.HAWK_SSH_KEY }}
+          HAWK_TARGET: ${{ secrets.HAWK_TARGET }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf 'StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+          bin/hawk-fetch > today.json
+      - uses: actions/cache/restore@v4
+        with:
+          path: baseline.json
+          key: hawk-${{ github.run_id }}
+          restore-keys: hawk-
+      - name: Diff against the last run
+        run: |
+          args=(--today today.json --summary-file "$GITHUB_STEP_SUMMARY")
+          [ -f baseline.json ] && args+=(--baseline baseline.json)
+          python bin/hawk-diff "${args[@]}"
+      - name: Keep today as the next baseline
+        if: success() || failure()
+        run: cp today.json baseline.json
+      - uses: actions/cache/save@v4
+        if: success() || failure()
+        with:
+          path: baseline.json
+          key: hawk-${{ github.run_id }}

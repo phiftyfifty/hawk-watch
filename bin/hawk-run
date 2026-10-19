@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# hawk-run — one daily pass: fetch a snapshot, diff it against the last one,
+# and keep it.
+#
+# Settings come from the environment, or from ${HAWK_CONFIG} if that file
+# exists (default ~/.config/hawk/env). Snapshots are kept in HAWK_SNAPSHOTS
+# (default ~/.local/state/hawk/snapshots). If that directory is a git repo,
+# each day's snapshot is committed there, so trends are a plain `git log -p`.
+#
+# Exit codes mirror hawk-diff: 0 healthy, 1 the data degraded, 2 the snapshot
+# could not be trusted or the host was unreachable.
+#
+# Usage: hawk-run [--no-save] [--no-notify]
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "${HERE}/.." && pwd)"
+
+HAWK_CONFIG="${HAWK_CONFIG:-$HOME/.config/hawk/env}"
+# shellcheck disable=SC1090
+[ -r "$HAWK_CONFIG" ] && { set -a; . "$HAWK_CONFIG"; set +a; }
+
+STATE="${HAWK_STATE:-$HOME/.local/state/hawk}"
+SNAPSHOTS="${HAWK_SNAPSHOTS:-$STATE/snapshots}"
+RULES="${HAWK_RULES:-$REPO/config/rules.json}"
+LOG="${STATE}/hawk.log"
+
+SAVE=1
+NOTIFY=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-save)   SAVE=0; shift;;
+        --no-notify) NOTIFY=0; shift;;
+        -h|--help)   sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
+        *) echo "hawk-run: unknown argument $1" >&2; exit 2;;
+    esac
+done
+
+mkdir -p "$STATE" "$SNAPSHOTS"
+STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DAY="$(date -u +%Y-%m-%d)"
+TARGET="${HAWK_TARGET:-localhost}"
+
+log() { printf '[%s] %s\n' "$STAMP" "$*" >> "$LOG"; }
+
+notify() {
+    [ "$NOTIFY" -eq 1 ] || return 0
+    # A scheduled run has no terminal to go red, so a desktop notification
+    # is how a bad day gets noticed.
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$1\" with title \"hawk\" sound name \"Basso\"" \
+            >/dev/null 2>&1 || true
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send hawk "$1" >/dev/null 2>&1 || true
+    fi
+}
+
+TODAY="$(mktemp "${TMPDIR:-/tmp}/hawk-today.XXXXXX")"
+SUMMARY="$(mktemp "${TMPDIR:-/tmp}/hawk-summary.XXXXXX")"
+trap 'rm -f "$TODAY" "$SUMMARY"' EXIT
+
+log "run start against ${TARGET}"
+
+if ! "${HERE}/hawk-fetch" > "$TODAY" 2>>"$LOG"; then
+    log "FAIL could not reach ${TARGET} or the probe returned nothing"
+    notify "Could not reach ${TARGET}. See ${LOG/#$HOME/~}"
+    echo "hawk: could not reach ${TARGET}; nothing was saved" >&2
+    exit 2
+fi
+
+BASELINE=()
+NEWEST="$(ls -1 "${SNAPSHOTS}"/*.json 2>/dev/null | sort | tail -1 || true)"
+[ -n "$NEWEST" ] && BASELINE=(--baseline "$NEWEST")
+
+PYTHON="${REPO}/.venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON=python3
+
+"$PYTHON" "${REPO}/bin/hawk-diff" --today "$TODAY" ${BASELINE[@]+"${BASELINE[@]}"} \
+    --rules "$RULES" --summary-file "$SUMMARY" > /dev/null
+RC=$?
+
+if [ "$RC" -eq 2 ]; then
+    log "FAIL snapshot could not be trusted; not saving"
+    notify "Today's snapshot failed validation. See ${LOG/#$HOME/~}"
+    cat "$SUMMARY" 2>/dev/null
+    exit 2
+fi
+
+if [ "$SAVE" -eq 1 ]; then
+    cp "$TODAY" "${SNAPSHOTS}/${DAY}.json"
+    if git -C "$SNAPSHOTS" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git -C "$SNAPSHOTS" add "${DAY}.json" && \
+        ! git -C "$SNAPSHOTS" diff --cached --quiet && \
+        git -C "$SNAPSHOTS" commit -qm "Snapshot ${TARGET} for ${DAY}" || \
+            log "snapshot unchanged; nothing to commit"
+    fi
+fi
+
+cat "$SUMMARY" 2>/dev/null
+
+if [ "$RC" -eq 0 ]; then
+    log "OK no findings"
+else
+    log "DEGRADED hawk-diff reported findings"
+    notify "Data on ${TARGET} degraded today. Run 'hawk-run --no-save' or read ${LOG/#$HOME/~}"
+fi
+
+exit "$RC"

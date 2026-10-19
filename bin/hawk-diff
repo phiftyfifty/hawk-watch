@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Compare today's snapshot against the previous one.
+
+Exit codes:
+  0  no findings
+  1  one or more findings (data degraded)
+  2  the snapshot could not be trusted (schema invalid, secret detected, unreadable)
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hawk.diff import compare          # noqa: E402
+from hawk.redact import SecretLeak, assert_no_secrets   # noqa: E402
+from hawk.report import render_summary  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def load_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def validate(snapshot):
+    import jsonschema
+    schema = load_json(REPO / "schema" / "snapshot.schema.json")
+    jsonschema.validate(snapshot, schema)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Diff two hawk snapshots.")
+    parser.add_argument("--today", required=True)
+    parser.add_argument("--baseline")
+    parser.add_argument("--rules", default=str(REPO / "config" / "rules.json"))
+    parser.add_argument("--summary-file")
+    args = parser.parse_args()
+
+    try:
+        today = load_json(args.today)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"could not read today's snapshot: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        validate(today)
+    except Exception as exc:
+        print(f"today's snapshot failed schema validation: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        assert_no_secrets(today)
+    except SecretLeak as exc:
+        print(f"refusing to proceed, possible secret in snapshot: {exc}", file=sys.stderr)
+        return 2
+
+    baseline = None
+    if args.baseline:
+        try:
+            baseline = load_json(args.baseline)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"ignoring unreadable baseline: {exc}", file=sys.stderr)
+
+    rules = load_json(args.rules)
+    findings = compare(today, baseline, rules)
+    summary = render_summary(today, findings)
+    print(summary)
+    if args.summary_file:
+        Path(args.summary_file).write_text(summary)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

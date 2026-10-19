@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# hawk-schedule — install, remove, or inspect a daily macOS LaunchAgent.
+#
+# Runs hawk-run once a day at HAWK_HOUR:HAWK_MINUTE local (default 09:15).
+# On Linux, use cron instead:  15 9 * * *  /path/to/hawk/bin/hawk-run
+#
+# Usage: hawk-schedule install | uninstall | status | run-now
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "${HERE}/.." && pwd)"
+LABEL="${HAWK_LABEL:-io.github.hawk-watch}"
+PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+STATE="${HAWK_STATE:-$HOME/.local/state/hawk}"
+HOUR="${HAWK_HOUR:-9}"
+MINUTE="${HAWK_MINUTE:-15}"
+
+usage() {
+    sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+write_plist() {
+    mkdir -p "${HOME}/Library/LaunchAgents" "$STATE"
+    cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>${REPO}/bin/hawk-run</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>${HOUR}</integer>
+        <key>Minute</key>
+        <integer>${MINUTE}</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${STATE}/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>${STATE}/launchd.log</string>
+</dict>
+</plist>
+PLIST_EOF
+}
+
+case "${1:-}" in
+    install)
+        command -v launchctl >/dev/null 2>&1 || {
+            echo "hawk-schedule: launchctl not found; on Linux use cron (see --help)" >&2; exit 2; }
+        write_plist
+        launchctl unload "$PLIST" 2>/dev/null || true
+        launchctl load "$PLIST"
+        echo "installed ${LABEL}, daily at $(printf '%02d:%02d' "$HOUR" "$MINUTE") local"
+        echo "log: ${STATE/#$HOME/~}/hawk.log"
+        ;;
+    uninstall)
+        launchctl unload "$PLIST" 2>/dev/null || true
+        rm -f "$PLIST"
+        echo "removed ${LABEL}"
+        ;;
+    status)
+        if [ -f "$PLIST" ]; then
+            echo "plist: ${PLIST/#$HOME/~}"
+            launchctl list 2>/dev/null | grep -q "$LABEL" \
+                && echo "loaded" || echo "not loaded (run: hawk-schedule install)"
+        else
+            echo "not installed (run: hawk-schedule install)"
+        fi
+        if [ -f "${STATE}/hawk.log" ]; then
+            echo "--- last 5 log lines ---"
+            tail -5 "${STATE}/hawk.log"
+        fi
+        ;;
+    run-now)
+        exec "${REPO}/bin/hawk-run"
+        ;;
+    ""|-h|--help)
+        usage
+        ;;
+    *)
+        echo "hawk-schedule: unknown command ${1}" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
